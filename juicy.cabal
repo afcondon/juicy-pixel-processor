@@ -30,6 +30,9 @@ executable juicy-exe
   build-depends:       base
                      , JuicyPixels
                      , JuicyPixels-extra
+                     , Glob
+                     , unix
+                     , optparse-applicative
                      , errors
                      , filepath
                      , directory

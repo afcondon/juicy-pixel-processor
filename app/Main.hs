@@ -1,98 +1,141 @@
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeOperators   #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Main  where
 
-import Codec.Picture
-import Codec.Picture.Types as M
-import System.Environment (getArgs)
-import System.Directory (createDirectoryIfMissing)
-import System.FilePath
+import           Codec.Picture
+import qualified Codec.Picture.Extra    as E
 import qualified Codec.Picture.Metadata as M
-import qualified Codec.Picture.Extra as E
-import Control.Error
-import Control.Monad.ST
-import Scaler16
-
+import           Codec.Picture.Types    as M
+import           Control.Error
+import           Control.Monad.ST
+import           Data.Foldable
+import           Data.Semigroup         ((<>))
+import           Options.Applicative
+import           Scaler16
+import           System.Directory       (createDirectoryIfMissing)
+import           System.Environment     (getArgs)
+import           System.FilePath
+import           System.FilePath.Glob
+import           System.Posix.Files     (fileExist)
 
 main :: IO ()
-main = do
-  [quality, longEdge, path] <- getArgs
-  let le = read longEdge
-  let q  = read quality
-  dynImg <- readImage path
+main = main' =<< execParser opts
+  where
+    opts = info (appOpts <**> helper)
+      ( fullDesc
+     <> progDesc "Scales and compresses images for web, and produces thumbnails"
+     <> header "juicy-exe -- Image processor for Hakyll static web" )
 
-  createDirectoryIfMissing False $ (takeDirectory path) </> "thumbs"
-
-  case resize le dynImg of
-    (Right img) -> saveJpgImage q (scaledFilename img path) img
-    (Left err) -> print ("Error scaling image" ++ err)
-
-  case resize 320 dynImg of
-    (Right img) -> saveJpgImage 80 (thumbFilename img path) img
-    (Left err) -> print ("Error scaling thumbnail" ++ err)
+main' :: AppOptions -> IO ()
+main' (AppOptions q le src dest) = do
+  createDirectoryIfMissing False dest
+  getglobbed <- glob (src ++ "**/*.jpg")
+  for_ getglobbed (processImage q le dest)
   return ()
 
-scaledFilename :: DynamicImage -> FilePath -> FilePath
-scaledFilename img path = dir </> name ++ "_" ++ show w ++ "x" ++ show h ++ ext
-  where (w,h) = getWidthHeight img
-        (dir, name, ext) = simpleSplitPath path
+data AppOptions = AppOptions {
+    quality     :: Int
+  , longedge    :: Int
+  , source      :: FilePath
+  , destination :: FilePath
+}
 
-thumbFilename :: DynamicImage -> FilePath -> String
-thumbFilename img path = dir </> "thumbs" </> name ++ "_thumb" ++ ext
-  where (dir, name, ext) = simpleSplitPath path
+appOpts :: Parser AppOptions
+appOpts = AppOptions
+      <$> option auto
+         ( long "quality"
+        <> short 'q'
+        <> help "Quality of output JPEG (percentage)"
+        <> showDefault
+        <> value 40
+        <> metavar "INT" )
+      <*> option auto
+         ( long "longedge"
+        <> short 'l'
+        <> help "Length of longest edge"
+        <> showDefault
+        <> value 2000
+        <> metavar "INT" )
+      <*> strOption
+          ( long "source"
+         <> short 's'
+         <> metavar "SOURCE"
+         <> help "Directory where images to be processed are found" )
+      <*> strOption
+          ( long "destination"
+         <> short 'd'
+         <> metavar "TARGET"
+         <> help "Directory to write the resized files and thumbnails" )
 
-simpleSplitPath :: FilePath -> (String, String, String)
-simpleSplitPath p = (takeDirectory p, takeBaseName p, takeExtension p)
+-- calc needs to be done as Rationals and then converted back to Ints
+chooseNewDimensions :: Int -> (Int, Int) -> (Int, Int)
+chooseNewDimensions le (w,h) =
+  toInts $ scaleTo (toRational le) (toRational w, toRational  h)
+  where
+    toInts (w,h) = (floor w, floor h)
+    scaleTo le (w,h) =
+      let ratio = le / max w h
+      in (w * ratio, h * ratio)
+
+processImage :: Int -> Int -> FilePath -> FilePath -> IO ()
+processImage quality le dest imagePath = do
+  possiblyImage <- readImage imagePath
+
+  case possiblyImage of
+    (Right dynImg) -> do
+      -- break down the FilePath of the image given and prepare all the bits needed for saving
+      let galleryName = last $ splitDirectories $ fst $ splitFileName imagePath -- "/a/b/c/d/foo.jpg" -> "d"
+      let imageBaseName = takeBaseName imagePath
+      let imageExtension = takeExtension imagePath
+      let imageDest  = dest </> galleryName
+      let thumbsDest = imageDest </> "thumbs"
+
+      -- make the target directories if necessary
+      createDirectoryIfMissing False imageDest
+      createDirectoryIfMissing False thumbsDest
+
+      -- generate the target filepaths so that we can check if they need to be converted
+      let (nw, nh) = chooseNewDimensions le $ getWidthHeight dynImg
+      let (tw, th) = chooseNewDimensions 320 $ getWidthHeight dynImg
+      let imagePath = imageDest </> imageBaseName ++ "_" ++ show nw ++ "x" ++ show nh ++ imageExtension
+      let thumbPath = thumbsDest </> imageBaseName ++ "_thumb" ++ imageExtension
+
+      -- resize for web and for thumbnail and save resulting images
+      resizeAndSave quality imagePath (nw,nh) dynImg
+      resizeAndSave 80 thumbPath (tw,th) dynImg
+
+    (Left err) -> print ("Error reading image: " ++ err)
+
+resizeAndSave :: Int -> FilePath -> (Int, Int) -> DynamicImage -> IO ()
+resizeAndSave q dest wh img = do
+  alreadyExists <- fileExist dest
+  if not alreadyExists
+  then saveJpgImage q dest $ resize wh img
+  else print ("file already present (" ++ dest ++ ") skipping")
 
 getWidthHeight :: DynamicImage -> (Int, Int)
-getWidthHeight (ImageRGB8 (Image w h _)) = (w,h)
+getWidthHeight (ImageRGB8 (Image w h _))   = (w,h)
 getWidthHeight (ImageYCbCr8 (Image w h _)) = (w,h)
-getWidthHeight (ImageCMYK8 (Image w h _)) = (w,h)
-getWidthHeight (ImageRGB16 (Image w h _)) = (w,h)
+getWidthHeight (ImageCMYK8 (Image w h _))  = (w,h)
+getWidthHeight (ImageRGB16 (Image w h _))  = (w,h)
 getWidthHeight (ImageCMYK16 (Image w h _)) = (w,h)
 -- following provided for totality but won't work with conversion/scaling
-getWidthHeight (ImageY8 (Image w h _)) = (w,h)
-getWidthHeight (ImageY16 (Image w h _)) = (w,h)
-getWidthHeight (ImageYF (Image w h _)) = (w,h)
-getWidthHeight (ImageYA8 (Image w h _)) = (w,h)
-getWidthHeight (ImageYA16 (Image w h _)) = (w,h)
-getWidthHeight (ImageRGBF (Image w h _)) = (w,h)
-getWidthHeight (ImageRGBA8 (Image w h _)) = (w,h)
+getWidthHeight (ImageY8 (Image w h _))     = (w,h)
+getWidthHeight (ImageY16 (Image w h _))    = (w,h)
+getWidthHeight (ImageYF (Image w h _))     = (w,h)
+getWidthHeight (ImageYA8 (Image w h _))    = (w,h)
+getWidthHeight (ImageYA16 (Image w h _))   = (w,h)
+getWidthHeight (ImageRGBF (Image w h _))   = (w,h)
+getWidthHeight (ImageRGBA8 (Image w h _))  = (w,h)
 getWidthHeight (ImageRGBA16 (Image w h _)) = (w,h)
 
 
-resize :: Int -> Either String DynamicImage -> Either String DynamicImage
-resize longEdge (Right (ImageRGB8 image))
-  = Right $ ImageRGB8 $ resize' longEdge image
-resize longEdge (Right (ImageYCbCr8 image))
-  = Right $ ImageRGB8 $ resize' longEdge (convertImage image)
-resize longEdge (Right (ImageCMYK8 image))
-  = Right $ ImageRGB8 $ resize' longEdge (convertImage image)
+resize :: (Int,Int) -> DynamicImage -> DynamicImage
+resize (w,h) (ImageRGB8 image)  = ImageRGB8 $ E.scaleBilinear w h image
+resize (w,h) (ImageRGB16 image) = ImageRGB16 $ scaleBilinear16 w h image
 
-resize longEdge (Right (ImageRGB16 image))
-  = Right $ ImageRGB16 $ resize16' longEdge image
-resize longEdge (Right (ImageCMYK16 image))
-  = Right $ ImageRGB16 $ resize16' longEdge (convertImage image)
+resize (w,h) (ImageYCbCr8 image) = ImageRGB8 $ E.scaleBilinear w h (convertImage image)
+resize (w,h) (ImageCMYK8 image)  = ImageRGB8 $ E.scaleBilinear w h (convertImage image)
+resize (w,h) (ImageCMYK16 image) = ImageRGB16 $ scaleBilinear16 w h (convertImage image)
 
-resize _ _ = Left "unsupported image format"
-
-resize' :: Int -> Image PixelRGB8 -> Image PixelRGB8
-resize' longEdge image@(Image w h _) =
-  let (nw,nh) = chooseNewDimensions longEdge w h
-  in E.scaleBilinear nw nh image
-
-resize16' :: Int -> Image PixelRGB16 -> Image PixelRGB16
-resize16' longEdge image@(Image w h _) =
-  let (nw,nh) = chooseNewDimensions longEdge w h
-  in scaleBilinear16 nw nh image
-
-chooseNewDimensions :: Int -> Int -> Int -> (Int, Int)
-chooseNewDimensions longEdge w h =
-  toInts $ chooseR le $ toRationals (w,h)
-  where
-    le = toRational longEdge
-    toInts (w,h) = (floor w, floor h)
-    toRationals (w,h) = (toRational w, toRational h)
-    chooseR le (w,h) = (w * ratio, h * ratio) -- calc needs to be done as Rationals
-      where ratio = le / max w h
+resize _ other = other -- file is unchanged if it's a format we can't resize TODO
